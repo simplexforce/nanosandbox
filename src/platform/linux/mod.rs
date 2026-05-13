@@ -12,6 +12,7 @@ use crate::error::{Result, SandboxError};
 use crate::network::ProxiedNetwork;
 use crate::platform::PlatformExecutor;
 use crate::result::ExecutionResult;
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 mod cgroup;
@@ -21,6 +22,24 @@ mod seccomp;
 pub use cgroup::CgroupManager;
 pub use namespace::{MountNamespace, UserNamespace, UtsNamespace};
 pub use seccomp::SeccompFilter;
+
+/// RawFd version of close
+fn close_raw(fd: RawFd) -> nix::Result<()> {
+    let ret = unsafe { libc::close(fd) };
+    nix::errno::Errno::result(ret).map(|_| ())
+}
+
+/// RawFd version of write
+fn write_raw(fd: RawFd, data: &[u8]) -> nix::Result<usize> {
+    let ret = unsafe { libc::write(fd, data.as_ptr() as _, data.len()) };
+    nix::errno::Errno::result(ret).map(|r| r as usize)
+}
+
+/// RawFd version of read
+fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
+    let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as _, buf.len()) };
+    nix::errno::Errno::result(ret).map(|r| r as usize)
+}
 
 /// Check if Linux sandboxing is supported
 pub fn is_supported() -> bool {
@@ -67,10 +86,8 @@ impl PlatformExecutor for LinuxExecutor {
     ) -> Result<ExecutionResult> {
         use nix::sched::{clone, CloneFlags};
         use nix::sys::signal::Signal;
-        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-        use nix::unistd::{close, execvp, pipe, read, write, Pid};
+        use nix::unistd::{execvp, pipe};
         use std::ffi::CString;
-        use std::os::unix::io::RawFd;
 
         const STACK_SIZE: usize = 1024 * 1024;
 
@@ -85,12 +102,21 @@ impl PlatformExecutor for LinuxExecutor {
         };
 
         // Create pipes for stdout, stderr, and synchronization
-        let (stdout_read, stdout_write) = pipe()?;
-        let (stderr_read, stderr_write) = pipe()?;
-        let (ready_read, ready_write) = pipe()?;
+        let (r, w) = pipe().map_err(|e| SandboxError::Internal(format!("create pipe for child stdout: {e}")))?;
+        let stdout_read: RawFd = r.into_raw_fd();
+        let stdout_write: RawFd = w.into_raw_fd();
+
+        let (r, w) = pipe().map_err(|e| SandboxError::Internal(format!("create pipe for child stderr: {e}")))?;
+        let stderr_read: RawFd = r.into_raw_fd();
+        let stderr_write: RawFd = w.into_raw_fd();
+
+        let (r, w) = pipe().map_err(|e| SandboxError::Internal(format!("create pipe for parent-child sync: {e}")))?;
+        let ready_read: RawFd = r.into_raw_fd();
+        let ready_write: RawFd = w.into_raw_fd();
+
         let (stdin_read, stdin_write) = if stdin.is_some() {
-            let (r, w) = pipe()?;
-            (Some(r), Some(w))
+            let (r, w) = pipe().map_err(|e| SandboxError::Internal(format!("create pipe for child stdin: {e}")))?;
+            (Some(r.into_raw_fd()), Some(w.into_raw_fd()))
         } else {
             (None, None)
         };
@@ -133,7 +159,8 @@ impl PlatformExecutor for LinuxExecutor {
         let user_ns = UserNamespace::new(config.uid, config.gid);
 
         // Clone child
-        let child_pid = clone(
+        let child_pid = unsafe {
+            clone(
             Box::new(move || {
                 // Create a new process group with this process as leader
                 // This allows us to kill all children with killpg
@@ -143,15 +170,15 @@ impl PlatformExecutor for LinuxExecutor {
 
                 // Wait for parent to setup UID/GID mappings
                 let mut buf = [0u8; 1];
-                let _ = read(ready_read, &mut buf);
-                let _ = close(ready_read);
+                let _ = read_raw(ready_read, &mut buf);
+                let _ = close_raw(ready_read);
 
                 // Setup stdin
                 if let Some(stdin_fd) = stdin_read {
                     unsafe {
                         libc::dup2(stdin_fd, libc::STDIN_FILENO);
                     }
-                    let _ = close(stdin_fd);
+                    let _ = close_raw(stdin_fd);
                 }
 
                 // Redirect stdout/stderr
@@ -159,10 +186,10 @@ impl PlatformExecutor for LinuxExecutor {
                     libc::dup2(stdout_write, libc::STDOUT_FILENO);
                     libc::dup2(stderr_write, libc::STDERR_FILENO);
                 }
-                let _ = close(stdout_write);
-                let _ = close(stderr_write);
-                let _ = close(stdout_read);
-                let _ = close(stderr_read);
+                let _ = close_raw(stdout_write);
+                let _ = close_raw(stderr_write);
+                let _ = close_raw(stdout_read);
+                let _ = close_raw(stderr_read);
 
                 // Setup hostname (UTS namespace)
                 if let Err(e) = nix::unistd::sethostname(&hostname) {
@@ -208,16 +235,17 @@ impl PlatformExecutor for LinuxExecutor {
             &mut stack,
             clone_flags,
             Some(Signal::SIGCHLD as i32),
-        )?;
+            )
+        }.map_err(|e| SandboxError::Internal(format!("clone sandboxed process: {e}")))?;
 
         // Parent process
 
         // Close child's end of pipes
-        close(ready_read)?;
-        close(stdout_write)?;
-        close(stderr_write)?;
+        close_raw(ready_read).map_err(|e| SandboxError::Internal(format!("close sync pipe read end in parent: {e}")))?;
+        close_raw(stdout_write).map_err(|e| SandboxError::Internal(format!("close stdout pipe write end in parent: {e}")))?;
+        close_raw(stderr_write).map_err(|e| SandboxError::Internal(format!("close stderr pipe write end in parent: {e}")))?;
         if let Some(fd) = stdin_read {
-            close(fd)?;
+            close_raw(fd).map_err(|e| SandboxError::Internal(format!("close stdin pipe read end in parent: {e}")))?;
         }
 
         // Write UID/GID mappings
@@ -244,13 +272,13 @@ impl PlatformExecutor for LinuxExecutor {
 
         // Write stdin if provided
         if let (Some(data), Some(fd)) = (stdin, stdin_write) {
-            let _ = write(fd, data);
-            close(fd)?;
+            let _ = write_raw(fd, data);
+            close_raw(fd).map_err(|e| SandboxError::Internal(format!("close stdin pipe write end after writing: {e}")))?;
         }
 
         // Signal child to continue
-        write(ready_write, &[0u8])?;
-        close(ready_write)?;
+        write_raw(ready_write, &[0u8]).map_err(|e| SandboxError::Internal(format!("signal child to continue: {e}")))?;
+        close_raw(ready_write).map_err(|e| SandboxError::Internal(format!("close sync pipe write end after signaling: {e}")))?;
 
         // Wait for child with timeout
         let timeout = config.wall_time_limit.unwrap_or(Duration::from_secs(3600));
@@ -305,7 +333,8 @@ fn setup_mount_namespace(
     use nix::mount::{mount, MsFlags};
 
     // Make everything private
-    mount::<str, str, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)?;
+    mount::<str, str, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)
+        .map_err(|e| SandboxError::Internal(format!("mark all mounts as private: {e}")))?;
 
     // Bind mount rootfs
     mount(
@@ -314,7 +343,8 @@ fn setup_mount_namespace(
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    )?;
+    )
+    .map_err(|e| SandboxError::Internal(format!("bind mount rootfs at {}: {e}", rootfs.display())))?;
 
     // Setup mounts
     for m in mounts {
@@ -332,7 +362,8 @@ fn setup_mount_namespace(
             None::<&str>,
             flags,
             None::<&str>,
-        )?;
+        )
+        .map_err(|e| SandboxError::Internal(format!("bind mount {} -> {}: {e}", m.source.display(), m.target.display())))?;
     }
 
     // Setup tmpfs mounts
@@ -347,19 +378,23 @@ fn setup_mount_namespace(
             Some("tmpfs"),
             MsFlags::empty(),
             Some(options.as_str()),
-        )?;
+        )
+        .map_err(|e| SandboxError::Internal(format!("mount tmpfs at {} (size={}): {e}", path.display(), size)))?;
     }
 
     // Pivot root
     let old_root = rootfs.join("old_root");
     std::fs::create_dir_all(&old_root)?;
 
-    nix::unistd::pivot_root(rootfs, &old_root)?;
+    nix::unistd::pivot_root(rootfs, &old_root)
+        .map_err(|e| SandboxError::Internal(format!("pivot_root into sandbox at {}: {e}", rootfs.display())))?;
     std::env::set_current_dir("/")?;
 
     // Unmount old root
-    mount::<str, str, str, str>(None, "/old_root", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)?;
-    nix::mount::umount2("/old_root", nix::mount::MntFlags::MNT_DETACH)?;
+    mount::<str, str, str, str>(None, "/old_root", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)
+        .map_err(|e| SandboxError::Internal(format!("mark /old_root as private mount: {e}")))?;
+    nix::mount::umount2("/old_root", nix::mount::MntFlags::MNT_DETACH)
+        .map_err(|e| SandboxError::Internal(format!("detach /old_root mount: {e}")))?;
     std::fs::remove_dir("/old_root")?;
 
     Ok(())
@@ -367,12 +402,11 @@ fn setup_mount_namespace(
 
 fn wait_with_timeout(
     pid: nix::unistd::Pid,
-    stdout_fd: std::os::unix::io::RawFd,
-    stderr_fd: std::os::unix::io::RawFd,
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
     timeout: Duration,
 ) -> Result<(String, String, i32, bool, Option<i32>)> {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::{close, read};
 
     let start = Instant::now();
     let mut stdout = Vec::new();
@@ -390,23 +424,25 @@ fn wait_with_timeout(
     loop {
         // Read available output
         let mut buf = [0u8; 4096];
-        if let Ok(n) = read(stdout_fd, &mut buf) {
+        if let Ok(n) = read_raw(stdout_fd, &mut buf) {
             if n > 0 {
                 stdout.extend_from_slice(&buf[..n]);
             }
         }
-        if let Ok(n) = read(stderr_fd, &mut buf) {
+        if let Ok(n) = read_raw(stderr_fd, &mut buf) {
             if n > 0 {
                 stderr.extend_from_slice(&buf[..n]);
             }
         }
 
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG))? {
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG))
+            .map_err(|e| SandboxError::Internal(format!("waitpid for child {pid}: {e}")))?
+        {
             WaitStatus::Exited(_, code) => {
                 drain_fd(stdout_fd, &mut stdout);
                 drain_fd(stderr_fd, &mut stderr);
-                close(stdout_fd).ok();
-                close(stderr_fd).ok();
+                close_raw(stdout_fd).ok();
+                close_raw(stderr_fd).ok();
                 return Ok((
                     String::from_utf8_lossy(&stdout).to_string(),
                     String::from_utf8_lossy(&stderr).to_string(),
@@ -418,8 +454,8 @@ fn wait_with_timeout(
             WaitStatus::Signaled(_, sig, _) => {
                 drain_fd(stdout_fd, &mut stdout);
                 drain_fd(stderr_fd, &mut stderr);
-                close(stdout_fd).ok();
-                close(stderr_fd).ok();
+                close_raw(stdout_fd).ok();
+                close_raw(stderr_fd).ok();
                 return Ok((
                     String::from_utf8_lossy(&stdout).to_string(),
                     String::from_utf8_lossy(&stderr).to_string(),
@@ -453,10 +489,10 @@ fn wait_with_timeout(
     }
 }
 
-fn drain_fd(fd: std::os::unix::io::RawFd, buf: &mut Vec<u8>) {
+fn drain_fd(fd: RawFd, buf: &mut Vec<u8>) {
     let mut tmp = [0u8; 4096];
     loop {
-        match nix::unistd::read(fd, &mut tmp) {
+        match read_raw(fd, &mut tmp) {
             Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
             _ => break,
         }
