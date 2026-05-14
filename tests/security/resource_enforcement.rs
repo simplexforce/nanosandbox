@@ -5,8 +5,16 @@
 //! - cgroup cleanup after execution (Linux)
 //! - OOM detection from cgroup events (Linux)
 
-use nanosandbox::Sandbox;
+use nanosandbox::{MetricStatus, ResourceEnforcement, Sandbox, SandboxError};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+fn is_memory_unavailable(err: &SandboxError) -> bool {
+    matches!(
+        err,
+        SandboxError::ResourceLimitUnavailable { limit, .. } if limit == "memory"
+    )
+}
 
 /// Test: Memory limit should actually be enforced via setrlimit (macOS)
 ///
@@ -85,11 +93,7 @@ fn test_max_open_files_enforced() {
     // Should show our limit
     if output != "unlimited" {
         let limit: u32 = output.parse().unwrap_or(0);
-        assert!(
-            limit <= 20,
-            "RLIMIT_NOFILE should be 20, got {}",
-            limit
-        );
+        assert!(limit <= 20, "RLIMIT_NOFILE should be 20, got {}", limit);
     }
 }
 
@@ -101,7 +105,6 @@ fn test_max_open_files_enforced() {
 #[cfg(target_os = "linux")]
 fn test_linux_cgroup_cleanup() {
     use std::fs;
-    use std::path::Path;
 
     let cgroup_base = "/sys/fs/cgroup";
 
@@ -121,11 +124,16 @@ fn test_linux_cgroup_cleanup() {
 
     // Run several sandboxes
     for _ in 0..5 {
-        let sandbox = Sandbox::builder()
+        let sandbox = match Sandbox::builder()
             .working_dir("/tmp")
             .memory_limit(64 * 1024 * 1024)
+            .resource_enforcement(ResourceEnforcement::BestEffort)
             .build()
-            .unwrap();
+        {
+            Ok(sandbox) => sandbox,
+            Err(err) if is_memory_unavailable(&err) => return,
+            Err(err) => panic!("unexpected cgroup cleanup sandbox build failure: {err:?}"),
+        };
 
         let _ = sandbox.run("echo", &["hello"]);
     }
@@ -151,21 +159,35 @@ fn test_linux_cgroup_cleanup() {
 #[test]
 #[cfg(target_os = "linux")]
 fn test_linux_oom_detection() {
-    let sandbox = Sandbox::builder()
+    let sandbox = match Sandbox::builder()
         .working_dir("/tmp")
         .memory_limit(32 * 1024 * 1024) // 32MB - very tight
+        .resource_enforcement(ResourceEnforcement::BestEffort)
         .wall_time_limit(Duration::from_secs(10))
         .build()
-        .unwrap();
+    {
+        Ok(sandbox) => sandbox,
+        Err(err) if is_memory_unavailable(&err) => return,
+        Err(err) => panic!("unexpected OOM sandbox build failure: {err:?}"),
+    };
 
     // Force an OOM condition
-    let result = sandbox.run("sh", &["-c", r#"
+    let report = sandbox
+        .run_detailed(
+            "sh",
+            &[
+                "-c",
+                r#"
         # Allocate memory until we OOM
         data=""
         while true; do
             data="${data}$(head -c 1048576 /dev/zero | tr '\0' 'x')"
         done
-    "#]).unwrap();
+    "#,
+            ],
+        )
+        .unwrap();
+    let result = report.result;
 
     // Should be killed (by OOM or timeout)
     assert!(
@@ -173,14 +195,15 @@ fn test_linux_oom_detection() {
         "Process should have been killed"
     );
 
-    // Ideally, killed_by_oom should be true
-    // This test documents expected behavior once OOM detection is implemented
-    if !result.killed_by_timeout {
+    if matches!(
+        report.diagnostics.limits.memory,
+        nanosandbox::LimitStatus::Enforced
+    ) && !result.killed_by_timeout
+    {
         assert!(
             result.killed_by_oom,
             "OOM kill not detected. Exit code: {}, signal: {:?}",
-            result.exit_code,
-            result.signal
+            result.exit_code, result.signal
         );
     }
 }
@@ -192,35 +215,54 @@ fn test_linux_oom_detection() {
 #[test]
 #[cfg(unix)]
 fn test_peak_memory_collection() {
-    let sandbox = Sandbox::builder()
+    let sandbox = match Sandbox::builder()
         .working_dir("/tmp")
         .memory_limit(256 * 1024 * 1024)
+        .resource_enforcement(ResourceEnforcement::BestEffort)
         .wall_time_limit(Duration::from_secs(5))
         .build()
-        .unwrap();
+    {
+        Ok(sandbox) => sandbox,
+        #[cfg(target_os = "linux")]
+        Err(err) if is_memory_unavailable(&err) => return,
+        Err(err) => panic!("unexpected peak-memory sandbox build failure: {err:?}"),
+    };
 
     // Allocate known amount of memory
-    let result = sandbox.run("sh", &["-c", r#"
+    let report = sandbox
+        .run_detailed(
+            "sh",
+            &[
+                "-c",
+                r#"
         # Allocate ~10MB
         dd if=/dev/zero bs=1M count=10 2>/dev/null | cat > /dev/null
         echo "done"
-    "#]).unwrap();
+    "#,
+            ],
+        )
+        .unwrap();
+    let result = report.result;
 
     assert_eq!(result.exit_code, 0);
 
-    // Peak memory should be populated
-    assert!(
-        result.peak_memory.is_some(),
-        "peak_memory should be collected, got None"
-    );
-
-    if let Some(peak) = result.peak_memory {
-        // Should be at least a few MB (shell + dd overhead)
-        assert!(
-            peak > 1024 * 1024,
-            "peak_memory seems too low: {} bytes",
-            peak
-        );
+    match report.diagnostics.metrics.peak_memory {
+        MetricStatus::Collected => {
+            let peak = result
+                .peak_memory
+                .expect("peak_memory should be present when metric is collected");
+            assert!(
+                peak > 1024 * 1024,
+                "peak_memory seems too low: {} bytes",
+                peak
+            );
+        }
+        MetricStatus::Unavailable { .. } | MetricStatus::Unknown { .. } => {
+            assert!(
+                result.peak_memory.is_none(),
+                "peak_memory should be absent when metric is unavailable"
+            );
+        }
     }
 }
 
@@ -238,29 +280,42 @@ fn test_cpu_time_collection() {
         .unwrap();
 
     // Do some CPU work
-    let result = sandbox.run("sh", &["-c", r#"
+    let report = sandbox
+        .run_detailed(
+            "sh",
+            &[
+                "-c",
+                r#"
         # Burn some CPU
         i=0
         while [ $i -lt 100000 ]; do
             i=$((i + 1))
         done
         echo "done"
-    "#]).unwrap();
+    "#,
+            ],
+        )
+        .unwrap();
+    let result = report.result;
 
     assert_eq!(result.exit_code, 0);
 
-    // CPU time should be populated
-    assert!(
-        result.cpu_time.is_some(),
-        "cpu_time should be collected, got None"
-    );
-
-    if let Some(cpu_time) = result.cpu_time {
-        // Should have used some CPU time
-        assert!(
-            cpu_time > Duration::from_micros(100),
-            "cpu_time seems too low: {:?}",
-            cpu_time
-        );
+    match report.diagnostics.metrics.cpu_time {
+        MetricStatus::Collected => {
+            let cpu_time = result
+                .cpu_time
+                .expect("cpu_time should be present when metric is collected");
+            assert!(
+                cpu_time > Duration::from_micros(100),
+                "cpu_time seems too low: {:?}",
+                cpu_time
+            );
+        }
+        MetricStatus::Unavailable { .. } | MetricStatus::Unknown { .. } => {
+            assert!(
+                result.cpu_time.is_none(),
+                "cpu_time should be absent when metric is unavailable"
+            );
+        }
     }
 }

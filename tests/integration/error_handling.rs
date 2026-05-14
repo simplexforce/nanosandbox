@@ -5,16 +5,21 @@
 //! - Resource pre-check (verify permissions before execution)
 //! - Detailed error types (distinguish command not found vs permission denied vs resource limit)
 
-use nanosandbox::{Sandbox, SandboxError};
+use nanosandbox::{ResourceEnforcement, Sandbox, SandboxError};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+fn is_memory_unavailable(err: &SandboxError) -> bool {
+    matches!(
+        err,
+        SandboxError::ResourceLimitUnavailable { limit, .. } if limit == "memory"
+    )
+}
 
 /// Test: Missing command should return CommandNotFound error
 #[test]
 fn test_error_command_not_found() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     let result = sandbox.run("nonexistent_command_xyz_123", &[]);
 
@@ -53,10 +58,7 @@ fn test_error_permission_denied() {
     File::create(&script).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
 
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     let result = sandbox.run(script.to_str().unwrap(), &[]);
 
@@ -86,7 +88,11 @@ fn test_error_permission_denied() {
 #[test]
 fn test_error_path_not_found() {
     let result = Sandbox::builder()
-        .mount("/nonexistent/path/xyz", "/sandbox/mount", nanosandbox::Permission::ReadOnly)
+        .mount(
+            "/nonexistent/path/xyz",
+            "/sandbox/mount",
+            nanosandbox::Permission::ReadOnly,
+        )
         .build();
 
     match result {
@@ -105,9 +111,7 @@ fn test_error_path_not_found() {
 /// Test: Invalid rootfs should return appropriate error
 #[test]
 fn test_error_invalid_rootfs() {
-    let result = Sandbox::builder()
-        .rootfs("/nonexistent/rootfs")
-        .build();
+    let result = Sandbox::builder().rootfs("/nonexistent/rootfs").build();
 
     match result {
         Err(SandboxError::PathNotFound(_)) => {
@@ -128,9 +132,7 @@ fn test_error_invalid_rootfs() {
 fn test_graceful_sandbox_exec_check() {
     // This test verifies we check for sandbox-exec availability
     // The actual sandbox creation should work on macOS
-    let result = Sandbox::builder()
-        .working_dir("/tmp")
-        .build();
+    let result = Sandbox::builder().working_dir("/tmp").build();
 
     // Should succeed on macOS where sandbox-exec exists
     assert!(result.is_ok(), "Sandbox should be available on macOS");
@@ -140,32 +142,46 @@ fn test_graceful_sandbox_exec_check() {
 #[test]
 #[cfg(target_os = "linux")]
 fn test_graceful_cgroup_check() {
-    use std::path::Path;
+    use nanosandbox::platform::linux::{probe_cgroup_support, CgroupController};
 
-    // Check if cgroups v2 is available
-    let cgroups_available = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-
-    let result = Sandbox::builder()
+    let strict = Sandbox::builder()
         .working_dir("/tmp")
         .memory_limit(64 * 1024 * 1024) // Requires cgroups
         .build();
 
-    if cgroups_available {
-        // With root/appropriate permissions, should work
-        // Without, should return appropriate error
-        match result {
-            Ok(_) => { /* Good */ }
-            Err(SandboxError::CgroupCreation(_)) => { /* Cgroup error - acceptable */ }
-            Err(SandboxError::CgroupV2Unavailable) => { /* Also acceptable */ }
-            Err(e) => {
-                // Any error should be descriptive, not a panic
-                let msg = format!("{:?}", e);
-                assert!(
-                    !msg.contains("panic") && !msg.contains("unwrap"),
-                    "Error should be graceful, got: {}",
-                    msg
-                );
+    let support = probe_cgroup_support();
+    if support.can_enforce(CgroupController::Memory) {
+        assert!(
+            strict.is_ok(),
+            "strict mode should succeed when memory controller is available"
+        );
+    } else {
+        match strict {
+            Err(SandboxError::ResourceLimitUnavailable { limit, .. }) => {
+                assert_eq!(limit, "memory");
             }
+            Err(e) => panic!("Expected ResourceLimitUnavailable, got: {:?}", e),
+            Ok(_) => panic!("Strict mode should fail closed when memory limit cannot be enforced"),
+        }
+    }
+
+    let best_effort = Sandbox::builder()
+        .working_dir("/tmp")
+        .memory_limit(64 * 1024 * 1024)
+        .resource_enforcement(ResourceEnforcement::BestEffort)
+        .build();
+    if support.can_enforce(CgroupController::Memory) {
+        assert!(
+            best_effort.is_ok(),
+            "best-effort mode should build when memory controller is available"
+        );
+    } else {
+        match best_effort {
+            Err(SandboxError::ResourceLimitUnavailable { limit, .. }) => {
+                assert_eq!(limit, "memory");
+            }
+            Err(e) => panic!("Expected ResourceLimitUnavailable, got: {:?}", e),
+            Ok(_) => panic!("best-effort memory should fail closed when memory cannot be enforced"),
         }
     }
 }
@@ -192,7 +208,11 @@ fn test_error_timeout_distinguishable() {
 #[test]
 fn test_error_contains_context() {
     let result = Sandbox::builder()
-        .mount("/nonexistent/specific/path/for/test", "/mnt", nanosandbox::Permission::ReadOnly)
+        .mount(
+            "/nonexistent/specific/path/for/test",
+            "/mnt",
+            nanosandbox::Permission::ReadOnly,
+        )
         .build();
 
     match result {
@@ -238,13 +258,24 @@ fn test_valid_config_succeeds() {
     let result = Sandbox::builder()
         .working_dir("/tmp")
         .memory_limit(256 * 1024 * 1024)
+        .resource_enforcement(ResourceEnforcement::BestEffort)
         .wall_time_limit(Duration::from_secs(60))
         .build();
+    #[cfg(target_os = "linux")]
+    if let Err(err) = &result {
+        if is_memory_unavailable(err) {
+            return;
+        }
+    }
 
     assert!(
         result.is_ok(),
         "Valid config should succeed: {}",
-        result.as_ref().err().map(|e| format!("{:?}", e)).unwrap_or_default()
+        result
+            .as_ref()
+            .err()
+            .map(|e| format!("{:?}", e))
+            .unwrap_or_default()
     );
 }
 
@@ -259,10 +290,7 @@ fn test_error_display_user_friendly() {
         let display = format!("{}", e);
 
         // Display should be readable
-        assert!(
-            !display.is_empty(),
-            "Error Display should not be empty"
-        );
+        assert!(!display.is_empty(), "Error Display should not be empty");
 
         // Should not expose internal details excessively
         assert!(

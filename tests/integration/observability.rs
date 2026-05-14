@@ -5,16 +5,21 @@
 //! - Execution metrics collection
 //! - Security audit logging
 
-use nanosandbox::Sandbox;
+use nanosandbox::{ResourceEnforcement, Sandbox, SandboxError};
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+fn is_memory_unavailable(err: &SandboxError) -> bool {
+    matches!(
+        err,
+        SandboxError::ResourceLimitUnavailable { limit, .. } if limit == "memory"
+    )
+}
 
 /// Test: ExecutionResult should contain timing information
 #[test]
 fn test_result_contains_timing() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     let result = sandbox.run("sleep", &["0.1"]).unwrap();
 
@@ -34,15 +39,9 @@ fn test_result_contains_timing() {
 /// Test: Sandbox should have unique, traceable ID
 #[test]
 fn test_sandbox_has_traceable_id() {
-    let sandbox1 = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox1 = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
-    let sandbox2 = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox2 = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     let id1 = sandbox1.id();
     let id2 = sandbox2.id();
@@ -56,7 +55,8 @@ fn test_sandbox_has_traceable_id() {
 
     // IDs should be suitable for logging (no special chars)
     assert!(
-        id1.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+        id1.chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
         "Sandbox ID should be log-friendly: {}",
         id1
     );
@@ -65,10 +65,7 @@ fn test_sandbox_has_traceable_id() {
 /// Test: Platform should be identifiable
 #[test]
 fn test_platform_identifiable() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     let platform = sandbox.platform();
 
@@ -93,14 +90,13 @@ fn test_platform_identifiable() {
 /// Test: Exit codes should be accurately captured
 #[test]
 fn test_exit_code_accuracy() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     // Test various exit codes
     for expected_code in [0, 1, 42, 127, 255] {
-        let result = sandbox.run("sh", &["-c", &format!("exit {}", expected_code)]).unwrap();
+        let result = sandbox
+            .run("sh", &["-c", &format!("exit {}", expected_code)])
+            .unwrap();
         assert_eq!(
             result.exit_code, expected_code,
             "Exit code mismatch: expected {}, got {}",
@@ -119,8 +115,15 @@ fn test_signal_capture() {
         .build()
         .unwrap();
 
-    // Process that kills itself
-    let result = sandbox.run("sh", &["-c", "kill -9 $$"]).unwrap();
+    // `kill -9 $$` is brittle here because shell PID semantics vary once the
+    // command is running as PID 1 inside the sandbox's PID namespace. Use a
+    // helper child to signal its parent shell instead.
+    let result = sandbox
+        .run(
+            "sh",
+            &["-c", "(sleep 0.1; kill -9 \"$PPID\") & while :; do :; done"],
+        )
+        .unwrap();
 
     // Should capture the signal
     assert!(
@@ -148,18 +151,20 @@ fn test_timeout_flag_accuracy() {
 
     // Command that does timeout
     let result = sandbox.run("sleep", &["10"]).unwrap();
-    assert!(result.killed_by_timeout, "sleep 10 should timeout with 100ms limit");
+    assert!(
+        result.killed_by_timeout,
+        "sleep 10 should timeout with 100ms limit"
+    );
 }
 
 /// Test: Stdout and stderr should be properly separated
 #[test]
 fn test_output_separation() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
-    let result = sandbox.run("sh", &["-c", "echo STDOUT; echo STDERR >&2"]).unwrap();
+    let result = sandbox
+        .run("sh", &["-c", "echo STDOUT; echo STDERR >&2"])
+        .unwrap();
 
     assert!(
         result.stdout.contains("STDOUT"),
@@ -184,30 +189,35 @@ fn test_output_separation() {
 /// Test: Resource metrics structure is present (even if values are None)
 #[test]
 fn test_resource_metrics_structure() {
-    let sandbox = Sandbox::builder()
+    let sandbox = match Sandbox::builder()
         .working_dir("/tmp")
         .memory_limit(128 * 1024 * 1024)
+        .resource_enforcement(ResourceEnforcement::BestEffort)
         .build()
-        .unwrap();
+    {
+        Ok(sandbox) => sandbox,
+        #[cfg(target_os = "linux")]
+        Err(err) if is_memory_unavailable(&err) => return,
+        Err(err) => panic!("unexpected observability sandbox build failure: {err:?}"),
+    };
 
-    let result = sandbox.run("echo", &["test"]).unwrap();
+    let report = sandbox.run_detailed("echo", &["test"]).unwrap();
+    let result = report.result;
 
     // These fields should exist (even if None currently)
     let _ = result.peak_memory;
     let _ = result.cpu_time;
     let _ = result.killed_by_oom;
+    let _ = report.diagnostics.metrics.peak_memory;
+    let _ = report.diagnostics.metrics.cpu_time;
 
-    // Once implemented, they should have values
-    // For now, just verify the structure exists
+    // Structured diagnostics should exist even when metrics are unavailable.
 }
 
 /// Test: Duration should be accurate for various execution times
 #[test]
 fn test_duration_accuracy() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     // Short command
     let result = sandbox.run("true", &[]).unwrap();
@@ -234,14 +244,14 @@ fn test_duration_accuracy() {
 /// Test: Multiple runs should each have independent metrics
 #[test]
 fn test_independent_metrics() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
+    let sleeps = ["0.2", "0.5", "0.8"];
     let results: Vec<_> = (0..3)
         .map(|i| {
-            sandbox.run("sh", &["-c", &format!("sleep 0.{}; echo {}", i + 1, i)]).unwrap()
+            sandbox
+                .run("sh", &["-c", &format!("sleep {}; echo {}", sleeps[i], i)])
+                .unwrap()
         })
         .collect();
 
@@ -253,9 +263,9 @@ fn test_independent_metrics() {
         );
     }
 
-    // Durations should be roughly increasing
+    // Durations should be meaningfully increasing, even under suite load.
     assert!(
-        results[0].duration < results[2].duration,
+        results[0].duration + Duration::from_millis(200) < results[2].duration,
         "Durations should reflect sleep time"
     );
 }
@@ -263,18 +273,23 @@ fn test_independent_metrics() {
 /// Test: Error output should be captured completely
 #[test]
 fn test_error_output_capture() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     // Generate multi-line error
-    let result = sandbox.run("sh", &["-c", r#"
+    let result = sandbox
+        .run(
+            "sh",
+            &[
+                "-c",
+                r#"
         echo "Error line 1" >&2
         echo "Error line 2" >&2
         echo "Error line 3" >&2
         exit 1
-    "#]).unwrap();
+    "#,
+            ],
+        )
+        .unwrap();
 
     assert_eq!(result.exit_code, 1);
     assert!(result.stderr.contains("Error line 1"));
@@ -320,16 +335,21 @@ fn test_large_output_capture() {
 /// Test: Binary output should not corrupt results
 #[test]
 fn test_binary_output_handling() {
-    let sandbox = Sandbox::builder()
-        .working_dir("/tmp")
-        .build()
-        .unwrap();
+    let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
     // Output some binary data
-    let result = sandbox.run("sh", &["-c", r#"
+    let result = sandbox
+        .run(
+            "sh",
+            &[
+                "-c",
+                r#"
         printf '\x00\x01\x02\x03'
         echo "text after binary"
-    "#]).unwrap();
+    "#,
+            ],
+        )
+        .unwrap();
 
     // Should not crash, text should be present
     assert!(

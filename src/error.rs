@@ -68,6 +68,15 @@ pub enum SandboxError {
         reason: String,
     },
 
+    #[error("Cgroup controller '{controller}' not available. Available: {available}. Rootless mode requires cgroup v2 delegation.")]
+    CgroupControllerUnavailable {
+        controller: String,
+        available: String,
+    },
+
+    #[error("Resource limit '{limit}' cannot be enforced: {reason}")]
+    ResourceLimitUnavailable { limit: String, reason: String },
+
     // Seccomp/security errors
     #[error("Failed to load security filter: {0}")]
     SecurityFilterLoad(String),

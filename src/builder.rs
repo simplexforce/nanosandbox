@@ -24,9 +24,7 @@ pub enum NetworkMode {
     /// Use host network (not recommended, breaks isolation)
     Host,
     /// Network access through proxy with domain whitelist
-    Proxied {
-        allowed_domains: Vec<String>,
-    },
+    Proxied { allowed_domains: Vec<String> },
 }
 
 /// Seccomp security profile (syscall filtering)
@@ -43,6 +41,31 @@ pub enum SeccompProfile {
     Permissive,
     /// Custom syscall whitelist
     Custom(Vec<String>),
+}
+
+/// How strictly Linux cgroup-backed resource limits should be enforced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ResourceEnforcement {
+    /// Fail closed when an explicitly requested cgroup-backed limit cannot be enforced.
+    #[default]
+    Strict,
+    /// Continue execution and surface any skipped limits through diagnostics.
+    BestEffort,
+}
+
+/// Tracks which cgroup-backed limits were explicitly requested by the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CgroupLimitRequests {
+    pub memory: bool,
+    pub cpu: bool,
+    pub pids: bool,
+}
+
+/// Execution policy derived from builder state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    pub resource_enforcement: ResourceEnforcement,
+    pub cgroup_limit_requests: CgroupLimitRequests,
 }
 
 /// Mount configuration
@@ -117,6 +140,8 @@ impl Default for SandboxConfig {
 #[derive(Clone)]
 pub struct SandboxBuilder {
     config: SandboxConfig,
+    resource_enforcement: ResourceEnforcement,
+    cgroup_limit_requests: CgroupLimitRequests,
 }
 
 impl Default for SandboxBuilder {
@@ -130,12 +155,20 @@ impl SandboxBuilder {
     pub fn new() -> Self {
         Self {
             config: SandboxConfig::default(),
+            resource_enforcement: ResourceEnforcement::Strict,
+            cgroup_limit_requests: CgroupLimitRequests::default(),
         }
     }
 
-    /// Get the current configuration (for internal use)
-    pub(crate) fn into_config(self) -> SandboxConfig {
-        self.config
+    /// Split the builder into config plus execution policy.
+    pub(crate) fn into_parts(self) -> (SandboxConfig, ExecutionPolicy) {
+        (
+            self.config,
+            ExecutionPolicy {
+                resource_enforcement: self.resource_enforcement,
+                cgroup_limit_requests: self.cgroup_limit_requests,
+            },
+        )
     }
 
     // ========== Filesystem ==========
@@ -178,12 +211,14 @@ impl SandboxBuilder {
     /// Set memory limit in bytes
     pub fn memory_limit(mut self, bytes: u64) -> Self {
         self.config.memory_limit = Some(bytes);
+        self.cgroup_limit_requests.memory = true;
         self
     }
 
     /// Set CPU limit (0.0 - N.0, where N is number of CPU cores)
     pub fn cpu_limit(mut self, cpus: f64) -> Self {
         self.config.cpu_limit = Some(cpus);
+        self.cgroup_limit_requests.cpu = true;
         self
     }
 
@@ -202,6 +237,16 @@ impl SandboxBuilder {
     /// Set maximum number of processes/threads
     pub fn max_pids(mut self, n: u32) -> Self {
         self.config.max_pids = Some(n);
+        self.cgroup_limit_requests.pids = true;
+        self
+    }
+
+    /// Control whether explicitly requested Linux cgroup-backed limits fail closed
+    /// or degrade best-effort when they cannot be enforced. In rootless Linux
+    /// execution, explicitly requested memory limits still fail closed unless a
+    /// usable delegated cgroup v2 parent is available.
+    pub fn resource_enforcement(mut self, enforcement: ResourceEnforcement) -> Self {
+        self.resource_enforcement = enforcement;
         self
     }
 
@@ -318,28 +363,57 @@ impl SandboxBuilder {
     fn pre_check_platform(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            // Check cgroup v2 support
-            if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-                return Err(SandboxError::Config(
-                    "cgroups v2 not available. Ensure cgroup v2 is mounted at /sys/fs/cgroup".into()
-                ));
+            let support = crate::platform::linux::probe_cgroup_support();
+
+            if self.cgroup_limit_requests.memory && unsafe { libc::geteuid() } != 0 {
+                if !support.can_enforce(crate::platform::linux::CgroupController::Memory) {
+                    return Err(SandboxError::ResourceLimitUnavailable {
+                        limit: "memory".into(),
+                        reason: support.unavailable_reason(Some(
+                            crate::platform::linux::CgroupController::Memory,
+                        )),
+                    });
+                }
             }
 
-            // Check if we can create cgroups (write permission)
-            if self.config.memory_limit.is_some()
-                || self.config.cpu_limit.is_some()
-                || self.config.max_pids.is_some()
+            let strict_limits = [
+                (
+                    self.cgroup_limit_requests.memory,
+                    crate::platform::linux::CgroupController::Memory,
+                    "memory",
+                ),
+                (
+                    self.cgroup_limit_requests.cpu,
+                    crate::platform::linux::CgroupController::Cpu,
+                    "cpu",
+                ),
+                (
+                    self.cgroup_limit_requests.pids,
+                    crate::platform::linux::CgroupController::Pids,
+                    "pids",
+                ),
+            ];
+
+            if self.resource_enforcement == ResourceEnforcement::Strict
+                && strict_limits.iter().any(|(requested, _, _)| *requested)
             {
-                let cgroup_base = std::path::Path::new("/sys/fs/cgroup");
-                if !cgroup_base.join("cgroup.subtree_control").exists() {
-                    return Err(SandboxError::Config(
-                        "cgroup subtree_control not available. Resource limits may not work".into()
-                    ));
+                for (requested, controller, name) in strict_limits {
+                    if !requested {
+                        continue;
+                    }
+                    if !support.can_enforce(controller) {
+                        return Err(SandboxError::ResourceLimitUnavailable {
+                            limit: name.into(),
+                            reason: support.unavailable_reason(Some(controller)),
+                        });
+                    }
                 }
             }
 
             // Check user namespace support
-            if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+            if let Ok(content) =
+                std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+            {
                 if content.trim() == "0" {
                     return Err(SandboxError::Config(
                         "Unprivileged user namespaces disabled. Run: sudo sysctl kernel.unprivileged_userns_clone=1".into()
@@ -353,7 +427,7 @@ impl SandboxBuilder {
             // Check sandbox-exec availability
             if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
                 return Err(SandboxError::Config(
-                    "sandbox-exec not found at /usr/bin/sandbox-exec".into()
+                    "sandbox-exec not found at /usr/bin/sandbox-exec".into(),
                 ));
             }
         }
@@ -382,13 +456,12 @@ mod tests {
     fn test_builder_memory_limit() {
         let builder = SandboxBuilder::new().memory_limit(512 * 1024 * 1024);
         assert_eq!(builder.config.memory_limit, Some(512 * 1024 * 1024));
+        assert!(builder.cgroup_limit_requests.memory);
     }
 
     #[test]
     fn test_builder_env() {
-        let builder = SandboxBuilder::new()
-            .env("FOO", "bar")
-            .env("BAZ", "qux");
+        let builder = SandboxBuilder::new().env("FOO", "bar").env("BAZ", "qux");
         assert_eq!(builder.config.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(builder.config.env.get("BAZ"), Some(&"qux".to_string()));
     }
@@ -409,12 +482,37 @@ mod tests {
         assert!(matches!(builder.config.network_mode, NetworkMode::Host));
 
         let builder = SandboxBuilder::new().allow_network(&["example.com"]);
-        assert!(matches!(builder.config.network_mode, NetworkMode::Proxied { .. }));
+        assert!(matches!(
+            builder.config.network_mode,
+            NetworkMode::Proxied { .. }
+        ));
     }
 
     #[test]
     fn test_seccomp_profile() {
         let builder = SandboxBuilder::new().seccomp_profile(SeccompProfile::Strict);
-        assert!(matches!(builder.config.seccomp_profile, SeccompProfile::Strict));
+        assert!(matches!(
+            builder.config.seccomp_profile,
+            SeccompProfile::Strict
+        ));
+    }
+
+    #[test]
+    fn test_resource_enforcement_default() {
+        let builder = SandboxBuilder::new();
+        assert_eq!(builder.resource_enforcement, ResourceEnforcement::Strict);
+        assert_eq!(
+            builder.cgroup_limit_requests,
+            CgroupLimitRequests::default()
+        );
+    }
+
+    #[test]
+    fn test_resource_enforcement_override() {
+        let builder = SandboxBuilder::new().resource_enforcement(ResourceEnforcement::BestEffort);
+        assert_eq!(
+            builder.resource_enforcement,
+            ResourceEnforcement::BestEffort
+        );
     }
 }

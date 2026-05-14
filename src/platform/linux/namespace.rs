@@ -43,31 +43,25 @@ impl UserNamespace {
 
         // Disable setgroups to allow unprivileged gid_map writes
         let setgroups_path = format!("/proc/{}/setgroups", child_pid);
-        fs::write(&setgroups_path, "deny").map_err(|e| {
-            SandboxError::NamespaceCreation {
-                ns_type: "user".into(),
-                reason: format!("Failed to write setgroups: {}", e),
-            }
+        fs::write(&setgroups_path, "deny").map_err(|e| SandboxError::NamespaceCreation {
+            ns_type: "user".into(),
+            reason: format!("Failed to write setgroups: {}", e),
         })?;
 
         // Write UID mapping: inner_uid outer_uid 1
         let uid_map = format!("{} {} 1", self.inner_uid, outer_uid);
         let uid_map_path = format!("/proc/{}/uid_map", child_pid);
-        fs::write(&uid_map_path, &uid_map).map_err(|e| {
-            SandboxError::NamespaceCreation {
-                ns_type: "user".into(),
-                reason: format!("Failed to write uid_map: {}", e),
-            }
+        fs::write(&uid_map_path, &uid_map).map_err(|e| SandboxError::NamespaceCreation {
+            ns_type: "user".into(),
+            reason: format!("Failed to write uid_map: {}", e),
         })?;
 
         // Write GID mapping: inner_gid outer_gid 1
         let gid_map = format!("{} {} 1", self.inner_gid, outer_gid);
         let gid_map_path = format!("/proc/{}/gid_map", child_pid);
-        fs::write(&gid_map_path, &gid_map).map_err(|e| {
-            SandboxError::NamespaceCreation {
-                ns_type: "user".into(),
-                reason: format!("Failed to write gid_map: {}", e),
-            }
+        fs::write(&gid_map_path, &gid_map).map_err(|e| SandboxError::NamespaceCreation {
+            ns_type: "user".into(),
+            reason: format!("Failed to write gid_map: {}", e),
         })?;
 
         Ok(())
@@ -96,11 +90,9 @@ impl UtsNamespace {
 
     /// Setup hostname in child process
     pub fn setup_in_child(&self) -> Result<()> {
-        nix::unistd::sethostname(&self.hostname).map_err(|e| {
-            SandboxError::NamespaceCreation {
-                ns_type: "uts".into(),
-                reason: e.to_string(),
-            }
+        nix::unistd::sethostname(&self.hostname).map_err(|e| SandboxError::NamespaceCreation {
+            ns_type: "uts".into(),
+            reason: e.to_string(),
         })?;
         Ok(())
     }
@@ -131,7 +123,12 @@ impl MountNamespace {
     }
 
     /// Add a bind mount
-    pub fn bind_mount(&mut self, source: &std::path::Path, target: &std::path::Path, readonly: bool) {
+    pub fn bind_mount(
+        &mut self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+        readonly: bool,
+    ) {
         self.bind_mounts
             .push((source.to_path_buf(), target.to_path_buf(), readonly));
     }

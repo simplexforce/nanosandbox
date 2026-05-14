@@ -5,7 +5,7 @@
 //! - Parallel execution safety
 //! - Cgroup name collision prevention (Linux)
 
-use nanosandbox::Sandbox;
+use nanosandbox::{ResourceEnforcement, Sandbox};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,10 +23,7 @@ fn test_sandbox_id_unique_across_threads() {
         let handle = thread::spawn(move || {
             let mut local_ids = vec![];
             for _ in 0..5 {
-                let sandbox = Sandbox::builder()
-                    .working_dir("/tmp")
-                    .build()
-                    .unwrap();
+                let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
                 local_ids.push(sandbox.id().to_string());
             }
             local_ids
@@ -85,9 +82,11 @@ fn test_parallel_execution_isolation() {
     let results = results.lock().unwrap();
     for (expected, actual) in results.iter() {
         assert_eq!(
-            actual, &expected.to_string(),
+            actual,
+            &expected.to_string(),
             "Sandbox {} got wrong environment value: {}",
-            expected, actual
+            expected,
+            actual
         );
     }
 }
@@ -96,10 +95,8 @@ fn test_parallel_execution_isolation() {
 #[test]
 #[cfg(target_os = "linux")]
 fn test_cgroup_no_conflicts() {
-    use std::fs;
     use std::path::Path;
 
-    let cgroup_base = "/sys/fs/cgroup";
     let mut handles = vec![];
 
     // Run sandboxes with memory limits (which create cgroups) in parallel
@@ -108,6 +105,7 @@ fn test_cgroup_no_conflicts() {
             let sandbox = Sandbox::builder()
                 .working_dir("/tmp")
                 .memory_limit(64 * 1024 * 1024)
+                .resource_enforcement(ResourceEnforcement::BestEffort)
                 .wall_time_limit(Duration::from_secs(5))
                 .build();
 
@@ -202,7 +200,9 @@ fn test_rapid_create_destroy() {
 
     // All should complete without panic
     for handle in handles {
-        handle.join().expect("Thread panicked during rapid create/destroy");
+        handle
+            .join()
+            .expect("Thread panicked during rapid create/destroy");
     }
 }
 
@@ -217,10 +217,7 @@ fn test_no_data_races() {
     for _ in 0..20 {
         let counter = Arc::clone(&success_count);
         let handle = thread::spawn(move || {
-            let sandbox = Sandbox::builder()
-                .working_dir("/tmp")
-                .build()
-                .unwrap();
+            let sandbox = Sandbox::builder().working_dir("/tmp").build().unwrap();
 
             let result = sandbox.run("echo", &["test"]).unwrap();
             if result.exit_code == 0 && result.stdout.trim() == "test" {

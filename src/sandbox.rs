@@ -3,10 +3,12 @@
 //! The main Sandbox struct that provides the high-level API for running
 //! sandboxed processes across different platforms.
 
-use crate::builder::{Permission, SandboxBuilder, SandboxConfig, SeccompProfile};
+use crate::builder::{
+    ExecutionPolicy, Permission, ResourceEnforcement, SandboxBuilder, SandboxConfig, SeccompProfile,
+};
 use crate::error::Result;
 use crate::platform::{get_executor, PlatformExecutor};
-use crate::result::ExecutionResult;
+use crate::result::{ExecutionReport, ExecutionResult};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,6 +34,7 @@ fn generate_sandbox_id() -> String {
 /// - **Windows**: Job Objects, Restricted Tokens
 pub struct Sandbox {
     config: SandboxConfig,
+    execution_policy: ExecutionPolicy,
     id: String,
     executor: Box<dyn PlatformExecutor>,
 }
@@ -55,7 +58,7 @@ impl Sandbox {
 
     /// Create a sandbox from a builder
     pub(crate) fn from_builder(builder: SandboxBuilder) -> Result<Self> {
-        let config = builder.into_config();
+        let (config, execution_policy) = builder.into_parts();
         let executor = get_executor();
 
         // Validate platform support for this configuration
@@ -63,6 +66,7 @@ impl Sandbox {
 
         Ok(Self {
             config,
+            execution_policy,
             id: generate_sandbox_id(),
             executor,
         })
@@ -115,7 +119,29 @@ impl Sandbox {
         args: &[&str],
         stdin: Option<&[u8]>,
     ) -> Result<ExecutionResult> {
-        self.executor.execute(&self.config, cmd, args, stdin)
+        let mut report = self.run_with_input_detailed(cmd, args, stdin)?;
+        if self.execution_policy.resource_enforcement == ResourceEnforcement::BestEffort {
+            if let Some(summary) = report.diagnostics.degradation_summary() {
+                append_best_effort_warning(&mut report.result.stderr, &summary);
+            }
+        }
+        Ok(report.result)
+    }
+
+    /// Run a command and return structured diagnostics alongside the result.
+    pub fn run_detailed(&self, cmd: &str, args: &[&str]) -> Result<ExecutionReport> {
+        self.run_with_input_detailed(cmd, args, None)
+    }
+
+    /// Run a command with optional stdin input and return structured diagnostics.
+    pub fn run_with_input_detailed(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecutionReport> {
+        self.executor
+            .execute_detailed(&self.config, &self.execution_policy, cmd, args, stdin)
     }
 
     /// Get the sandbox ID
@@ -254,9 +280,22 @@ impl Sandbox {
     }
 }
 
+fn append_best_effort_warning(stderr: &mut String, summary: &str) {
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push_str("[nanosandbox] best-effort degradation: ");
+    stderr.push_str(summary);
+    stderr.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result::{
+        ExecutionDiagnostics, ExecutionReport, LimitDiagnostics, LimitStatus, MetricDiagnostics,
+        MetricStatus,
+    };
 
     #[test]
     fn test_sandbox_id_generation() {
@@ -271,9 +310,10 @@ mod tests {
             .memory_limit(512 * 1024 * 1024)
             .hostname("test");
 
-        let config = builder.into_config();
+        let (config, policy) = builder.into_parts();
         assert_eq!(config.memory_limit, Some(512 * 1024 * 1024));
         assert_eq!(config.hostname, "test");
+        assert!(policy.cgroup_limit_requests.memory);
     }
 
     #[test]
@@ -283,5 +323,35 @@ mod tests {
         let _ = Sandbox::code_judge("/code");
         let _ = Sandbox::agent_executor("/workspace");
         let _ = Sandbox::interactive("/home");
+    }
+
+    #[test]
+    fn test_append_best_effort_warning() {
+        let mut report = ExecutionReport {
+            result: ExecutionResult::default(),
+            diagnostics: ExecutionDiagnostics {
+                limits: LimitDiagnostics {
+                    memory: LimitStatus::NotEnforced {
+                        reason: "memory controller unavailable".into(),
+                    },
+                    cpu: LimitStatus::NotRequested,
+                    pids: LimitStatus::NotRequested,
+                },
+                metrics: MetricDiagnostics {
+                    peak_memory: MetricStatus::Unavailable {
+                        reason: "memory stats missing".into(),
+                    },
+                    cpu_time: MetricStatus::Collected,
+                },
+            },
+        };
+
+        if let Some(summary) = report.diagnostics.degradation_summary() {
+            append_best_effort_warning(&mut report.result.stderr, &summary);
+        }
+
+        assert!(report.result.stderr.contains("best-effort degradation"));
+        assert!(report.result.stderr.contains("memory limit not enforced"));
+        assert!(report.result.stderr.contains("peak memory unavailable"));
     }
 }

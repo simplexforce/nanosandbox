@@ -20,9 +20,9 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use crate::builder::SandboxConfig;
+use crate::builder::{ExecutionPolicy, SandboxConfig};
 use crate::error::Result;
-use crate::result::ExecutionResult;
+use crate::result::{ExecutionReport, ExecutionResult};
 
 /// Platform-specific sandbox executor trait
 ///
@@ -47,6 +47,20 @@ pub trait PlatformExecutor: Send + Sync {
         args: &[&str],
         stdin: Option<&[u8]>,
     ) -> Result<ExecutionResult>;
+
+    /// Execute a command and return detailed diagnostics when available.
+    fn execute_detailed(
+        &self,
+        config: &SandboxConfig,
+        policy: &ExecutionPolicy,
+        cmd: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> Result<ExecutionReport> {
+        let _ = policy;
+        self.execute(config, cmd, args, stdin)
+            .map(|result| ExecutionReport::from_result(policy, result))
+    }
 
     /// Check if this platform supports all requested features
     ///

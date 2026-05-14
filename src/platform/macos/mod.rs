@@ -87,7 +87,10 @@ impl MacOSExecutor {
 
         // Working directory write access
         let working_dir = config.working_dir.to_string_lossy();
-        profile.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", working_dir));
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            working_dir
+        ));
 
         // Custom mount write access
         for mount in &config.mounts {
@@ -106,7 +109,10 @@ impl MacOSExecutor {
         // Rootfs write access if specified
         if let Some(rootfs) = &config.rootfs {
             let rootfs_str = rootfs.to_string_lossy();
-            profile.push_str(&format!("(allow file-write* (subpath \"{}\"))\n", rootfs_str));
+            profile.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                rootfs_str
+            ));
         }
 
         // Network rules
@@ -185,7 +191,6 @@ impl MacOSExecutor {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
-
 }
 
 impl Default for MacOSExecutor {
@@ -316,7 +321,10 @@ impl PlatformExecutor for MacOSExecutor {
         }
 
         // Check for unsupported features
-        if !matches!(config.seccomp_profile, SeccompProfile::Disabled | SeccompProfile::Standard) {
+        if !matches!(
+            config.seccomp_profile,
+            SeccompProfile::Disabled | SeccompProfile::Standard
+        ) {
             // Custom seccomp profiles are not directly supported on macOS
             // We map them to sandbox-exec profiles instead
         }
@@ -340,9 +348,7 @@ impl MacOSExecutor {
             let mut status: libc::c_int = 0;
             let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
 
-            let result = unsafe {
-                libc::wait4(child_pid, &mut status, libc::WNOHANG, &mut rusage)
-            };
+            let result = unsafe { libc::wait4(child_pid, &mut status, libc::WNOHANG, &mut rusage) };
 
             if result == child_pid {
                 // Process exited, collect output
@@ -402,9 +408,10 @@ impl MacOSExecutor {
                 // Error
                 Self::kill_process_group(child_pid);
                 let _ = child.wait();
-                return Err(SandboxError::ExecutionFailed(
-                    format!("wait4 failed: {}", std::io::Error::last_os_error())
-                ));
+                return Err(SandboxError::ExecutionFailed(format!(
+                    "wait4 failed: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
     }

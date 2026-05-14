@@ -26,19 +26,32 @@
 //! let result = sandbox.run("python3", &["-c", "print('hello')"]).unwrap();
 //! println!("{}", result.stdout);
 //! ```
+//!
+//! On Linux, explicitly requested cgroup-backed limits fail closed by default.
+//! `ResourceEnforcement::BestEffort` only relaxes controllers that can still be
+//! honestly provisioned on the current execution path. Rootless memory limits
+//! continue to fail closed unless a usable delegated cgroup v2 parent is
+//! available; inspect `Sandbox::run_detailed()` diagnostics for degraded
+//! non-memory limits.
 
-pub mod error;
-pub mod platform;
-pub mod sandbox;
 pub mod builder;
-pub mod result;
+pub mod error;
 pub mod network;
+pub mod platform;
+pub mod result;
+pub mod sandbox;
 
 // Re-exports
+pub use builder::{
+    CgroupLimitRequests, ExecutionPolicy, NetworkMode, Permission, ResourceEnforcement,
+    SandboxBuilder, SeccompProfile,
+};
 pub use error::{Result, SandboxError};
+pub use result::{
+    ExecutionDiagnostics, ExecutionReport, ExecutionResult, LimitDiagnostics, LimitStatus,
+    MetricDiagnostics, MetricStatus,
+};
 pub use sandbox::Sandbox;
-pub use builder::{SandboxBuilder, Permission, NetworkMode, SeccompProfile};
-pub use result::ExecutionResult;
 
 /// 1 KB in bytes
 pub const KB: u64 = 1024;

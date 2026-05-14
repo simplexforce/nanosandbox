@@ -7,7 +7,10 @@
 
 use nanosandbox::Sandbox;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Duration;
+
+static PROCESS_TABLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Test: Zombie processes should NOT accumulate after timeout kills
 ///
@@ -16,6 +19,7 @@ use std::time::Duration;
 #[test]
 #[cfg(unix)]
 fn test_no_zombie_after_timeout() {
+    let _guard = PROCESS_TABLE_TEST_LOCK.lock().unwrap();
     let initial_zombies = count_zombie_processes();
 
     // Run multiple sandboxes that will timeout
@@ -54,6 +58,7 @@ fn test_no_zombie_after_timeout() {
 #[test]
 #[cfg(unix)]
 fn test_process_group_killing() {
+    let _guard = PROCESS_TABLE_TEST_LOCK.lock().unwrap();
     let sandbox = Sandbox::builder()
         .working_dir("/tmp")
         .wall_time_limit(Duration::from_secs(2))
@@ -61,25 +66,21 @@ fn test_process_group_killing() {
         .unwrap();
 
     // Start a script that spawns child processes
-    let result = sandbox.run("sh", &["-c",
-        "sleep 7777 & sleep 7777 & sleep 7777"
-    ]).unwrap();
+    let result = sandbox
+        .run("sh", &["-c", "sleep 7777 & sleep 7777 & sleep 7777"])
+        .unwrap();
 
     assert!(
         result.killed_by_timeout,
         "Expected timeout, got exit_code={}, duration={:?}, stderr={}",
-        result.exit_code,
-        result.duration,
-        result.stderr
+        result.exit_code, result.duration, result.stderr
     );
 
     // Wait a moment for process cleanup
     std::thread::sleep(Duration::from_millis(500));
 
     // Check that no orphan sleep 7777 processes remain
-    let orphans = Command::new("pgrep")
-        .args(&["-f", "sleep 7777"])
-        .output();
+    let orphans = Command::new("pgrep").args(&["-f", "sleep 7777"]).output();
 
     if let Ok(output) = orphans {
         let orphan_pids: Vec<_> = String::from_utf8_lossy(&output.stdout)
@@ -101,6 +102,7 @@ fn test_process_group_killing() {
 #[test]
 #[cfg(unix)]
 fn test_sigterm_cleanup() {
+    let _guard = PROCESS_TABLE_TEST_LOCK.lock().unwrap();
     // We can't easily test SIGTERM on ourselves, but we can verify
     // the sandbox properly cleans up on normal termination
     let sandbox = Sandbox::builder()
@@ -125,6 +127,7 @@ fn test_sigterm_cleanup() {
 #[test]
 #[cfg(unix)]
 fn test_rapid_sandbox_no_leaks() {
+    let _guard = PROCESS_TABLE_TEST_LOCK.lock().unwrap();
     let initial_zombies = count_zombie_processes();
 
     for _ in 0..20 {
@@ -154,6 +157,7 @@ fn test_rapid_sandbox_no_leaks() {
 #[test]
 #[cfg(unix)]
 fn test_deep_process_tree_killed() {
+    let _guard = PROCESS_TABLE_TEST_LOCK.lock().unwrap();
     let sandbox = Sandbox::builder()
         .working_dir("/tmp")
         .wall_time_limit(Duration::from_secs(2))
@@ -162,24 +166,20 @@ fn test_deep_process_tree_killed() {
 
     // Create a deep process tree with unique sleep time
     // Use proper shell syntax: command1 & command2
-    let result = sandbox.run("sh", &["-c",
-        "sh -c 'sh -c \"sleep 8888\" &' & sleep 8888"
-    ]).unwrap();
+    let result = sandbox
+        .run("sh", &["-c", "sh -c 'sh -c \"sleep 8888\" &' & sleep 8888"])
+        .unwrap();
 
     assert!(
         result.killed_by_timeout,
         "Expected timeout, got exit_code={}, duration={:?}, stderr={}",
-        result.exit_code,
-        result.duration,
-        result.stderr
+        result.exit_code, result.duration, result.stderr
     );
 
     // Verify no deep children survive
     std::thread::sleep(Duration::from_millis(500));
 
-    let orphans = Command::new("pgrep")
-        .args(&["-f", "sleep 8888"])
-        .output();
+    let orphans = Command::new("pgrep").args(&["-f", "sleep 8888"]).output();
 
     if let Ok(output) = orphans {
         assert!(
@@ -194,13 +194,18 @@ fn test_deep_process_tree_killed() {
 
 #[cfg(unix)]
 fn count_zombie_processes() -> usize {
+    let current_pid = std::process::id().to_string();
     let output = Command::new("ps")
-        .args(&["aux"])
+        .args(["-axo", "ppid=,stat="])
         .output()
         .expect("Failed to run ps");
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(" Z ") || line.contains(" Z+ "))
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        })
+        .filter(|(ppid, stat)| ppid == &current_pid && stat.starts_with('Z'))
         .count()
 }

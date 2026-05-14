@@ -83,7 +83,11 @@ print(a + b)
 
         // Run with input
         let result = sandbox
-            .run_with_input("python3", &["/workspace/solution.py"], Some(tc.input.as_bytes()))
+            .run_with_input(
+                "python3",
+                &["/workspace/solution.py"],
+                Some(tc.input.as_bytes()),
+            )
             .expect("Execution failed");
 
         let output = result.stdout.trim();
@@ -111,11 +115,7 @@ print(a + b)
     }
 
     println!("\n--- Summary ---");
-    println!(
-        "Result: {}/{} passed",
-        passed,
-        test_cases.len()
-    );
+    println!("Result: {}/{} passed", passed, test_cases.len());
     println!("Total time: {:?}", total_time);
 
     if passed == test_cases.len() {

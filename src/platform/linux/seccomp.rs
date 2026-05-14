@@ -127,6 +127,9 @@ const STANDARD_SYSCALLS: &[&str] = &[
     "gettimeofday",
     "clock_gettime",
     "nanosleep",
+    "getrlimit",
+    "setrlimit",
+    "prlimit64",
     // Signals
     "rt_sigaction",
     "rt_sigprocmask",
