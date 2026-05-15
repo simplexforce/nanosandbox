@@ -16,9 +16,10 @@ pub enum Permission {
 }
 
 /// Network access mode
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum NetworkMode {
     /// No network access (default, most secure)
+    #[default]
     None,
     /// Use host network (not recommended, breaks isolation)
     Host,
@@ -28,31 +29,20 @@ pub enum NetworkMode {
     },
 }
 
-impl Default for NetworkMode {
-    fn default() -> Self {
-        NetworkMode::None
-    }
-}
-
 /// Seccomp security profile (syscall filtering)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SeccompProfile {
     /// Disable seccomp filtering (not recommended)
     Disabled,
     /// Allow only safe syscalls (most restrictive)
     Strict,
     /// Standard set of allowed syscalls
+    #[default]
     Standard,
     /// More permissive, for interactive use
     Permissive,
     /// Custom syscall whitelist
     Custom(Vec<String>),
-}
-
-impl Default for SeccompProfile {
-    fn default() -> Self {
-        SeccompProfile::Standard
-    }
 }
 
 /// Mount configuration

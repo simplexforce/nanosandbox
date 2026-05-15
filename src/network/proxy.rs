@@ -321,13 +321,13 @@ impl HttpProxy {
 
         // Wildcard match (*.example.com)
         for pattern in allowed.iter() {
-            if pattern.starts_with("*.") {
-                let suffix = &pattern[1..]; // .example.com
-                if domain.ends_with(suffix) {
+            if let Some(stripped) = pattern.strip_prefix("*.") {
+                // stripped is ".example.com"
+                if domain.ends_with(stripped) {
                     return true;
                 }
                 // Also match the base domain (*.example.com matches example.com)
-                if domain == &pattern[2..] {
+                if domain == stripped {
                     return true;
                 }
             }
