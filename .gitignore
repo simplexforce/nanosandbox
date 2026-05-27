@@ -83,3 +83,6 @@ htmlcov/
 *.bak
 *.tmp
 *.temp
+
+# For local drafts
+/.draft/
